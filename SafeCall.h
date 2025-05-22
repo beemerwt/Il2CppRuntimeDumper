@@ -1,5 +1,4 @@
 #pragma once
-#include <optional>
 
 template <typename T>
 struct SafeCall {};
@@ -15,7 +14,7 @@ struct SafeCall<ReturnType(*)(Args...)> {
         func = f;
     }
 
-    ReturnType operator()(Args...) {
+    ReturnType operator()(Args... args) {
         __try {
             return func(args...);
         }

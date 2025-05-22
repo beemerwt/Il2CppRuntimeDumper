@@ -313,9 +313,7 @@ void DumpCppStyleClass(std::ofstream& file, const Il2CppImage* image, Il2CppClas
         const char* fieldTypeName = il2cpp_type_get_name(fieldType);
         if (!fieldTypeName) continue;
 
-        unsigned int attrs = reinterpret_cast<unsigned int>(il2cpp_type_get_attrs(fieldType));
-        if (!attrs) continue;
-
+        unsigned int attrs = il2cpp_type_get_attrs(fieldType);
         int offset = il2cpp_field_get_offset(field);
 
         std::string typeName = std::string(fieldTypeName);
@@ -466,7 +464,7 @@ void DumpAllTypes(HMODULE gameAssembly, const std::string& outputPath) {
     }
 }
 
-DLLEXPORT void DumpIl2CppRuntime(HMODULE gameAssembly, const std::string& outputPath) {
+IL2RD_API void DumpIl2CppRuntime(HMODULE gameAssembly, const std::string& outputPath) {
     if (!gameAssembly) {
         std::cout << "[Dumper] Invalid game assembly handle\n";
         return;

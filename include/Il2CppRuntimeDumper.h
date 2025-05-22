@@ -1,17 +1,13 @@
 #pragma once
-
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-
 #include <Windows.h>
+#include <string>
 
-#ifndef IL2CPP_RUNTIME_DUMPER_STATIC
-#define DLLIMPORT __declspec(dllimport)
-#define DLLEXPORT __declspec(dllexport)
+#if defined(RD_STATIC)
+# define IL2RD_API
+#elif defined(RD_DYNAMIC)
+# define IL2RD_API __declspec(dllexport)
 #else
-#define DLLIMPORT
-#define DLLEXPORT
+# define IL2RD_API __declspec(dllimport)
 #endif
 
-DLLIMPORT void DumpIl2CppRuntime(HMODULE gameAssembly, const char* outputPath);
+IL2RD_API void DumpIl2CppRuntime(HMODULE gameAssembly, const std::string& outputPath);

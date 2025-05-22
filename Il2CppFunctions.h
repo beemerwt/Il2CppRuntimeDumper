@@ -37,4 +37,4 @@ typedef const Il2CppType* (*il2cpp_method_get_param_fn)(const MethodInfo* method
 
 // Type functions
 typedef const char* (*il2cpp_type_get_name_fn)(const Il2CppType* type);
-typedef const Il2CppCustomAttrInfo (*il2cpp_type_get_attrs_fn)(const Il2CppType* type);
+typedef unsigned int (*il2cpp_type_get_attrs_fn)(const Il2CppType* type);

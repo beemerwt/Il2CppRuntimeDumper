@@ -7,5 +7,3 @@ typedef void Il2CppClass;
 typedef void Il2CppType;
 typedef void FieldInfo;
 typedef void MethodInfo;
-
-typedef struct Il2CppCustomAttrInfo Il2CppCustomAttrInfo;
