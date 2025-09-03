@@ -7,3 +7,4 @@ typedef void Il2CppClass;
 typedef void Il2CppType;
 typedef void FieldInfo;
 typedef void MethodInfo;
+typedef void Il2CppObject;

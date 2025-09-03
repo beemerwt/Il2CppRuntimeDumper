@@ -7,30 +7,70 @@
 #include <ostream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <functional>
 #include <cstdint>
+#include <mutex>
+
+#define IL2CPP_TYPE_END        0   // End of List
+#define IL2CPP_TYPE_VOID       1   // System.Void
+#define IL2CPP_TYPE_BOOLEAN    2   // System.Boolean
+#define IL2CPP_TYPE_CHAR       3   // System.Char
+
+// Signed integrals
+#define IL2CPP_TYPE_I1   4   // System.SByte
+#define IL2CPP_TYPE_I2   6   // System.Int16
+#define IL2CPP_TYPE_I4   8   // System.Int32
+#define IL2CPP_TYPE_I8   10  // System.Int64
+
+// Unsigned integrals
+#define IL2CPP_TYPE_U1   5   // System.Byte
+#define IL2CPP_TYPE_U2   7   // System.UInt16
+#define IL2CPP_TYPE_U4   9   // System.UInt32
+#define IL2CPP_TYPE_U8   11  // System.UInt64
+
+// then I1..U8 as above
+#define IL2CPP_TYPE_R4        12   // System.Single
+#define IL2CPP_TYPE_R8        13   // System.Double
+#define IL2CPP_TYPE_STRING    14   // System.String
 
 // You can change this to the directory you want to dump the files to
 #define DUMP_DIR "Il2CppDump"
 
 // You can replace this with your own version of the Il2Cpp header
-#include "DummyIl2Cpp.h"
+#include "DummyIl2Cpp.hpp"
 
-#include "include/Il2CppRuntimeDumper.h"
-#include "Il2CppFunctions.h"
-#include "SafeCall.h"
+#include "Il2CppRuntimeDumper.hpp"
+#include "Il2CppFunctions.hpp"
+#include "SafeCall.hpp"
 
 #define FIELD_ATTRIBUTE_STATIC 0x0010
 #define FIELD_ATTRIBUTE_LITERAL 0x0040
 #define FIELD_ATTRIBUTE_NOT_SERIALIZED 0x0080
 #define FIELD_ATTRIBUTE_HAS_FIELD_RVA 0x0100
 
+struct EnumFieldTracker {
+    std::string enumName;
+    std::string fieldName;
+    Il2CppClass* klass;
+    size_t offset;
+    std::string baseType;
+};
+
+std::ostringstream oss;
+std::vector<EnumFieldTracker> unresolvedEnums;
+std::mutex enumMutex;
+
+void DumpLog() {
+    OutputDebugStringA(oss.str().c_str());
+    oss.str("");
+}
+
 // Domain functions
 SafeCall<il2cpp_domain_get_fn> il2cpp_domain_get;
 SafeCall<il2cpp_domain_get_assemblies_fn> il2cpp_domain_get_assemblies;
 
 // Assembly functions
-SafeCall<il2cpp_assembly_get_name_fn> il2cpp_assembly_get_name;
 SafeCall<il2cpp_assembly_get_image_fn> il2cpp_assembly_get_image;
 
 // Image functions
@@ -47,11 +87,20 @@ SafeCall<il2cpp_class_from_type_fn> il2cpp_class_from_type;
 SafeCall<il2cpp_class_get_type_fn> il2cpp_class_get_type;
 SafeCall<il2cpp_class_get_image_fn> il2cpp_class_get_image;
 SafeCall<il2cpp_class_get_parent_fn> il2cpp_class_get_parent;
+SafeCall<il2cpp_class_get_element_class_fn> il2cpp_class_get_element_class;
+
+// Enum Class functions
+SafeCall<il2cpp_class_is_enum_fn> il2cpp_class_is_enum;
+SafeCall<il2cpp_class_enum_basetype_fn> il2cpp_class_enum_basetype;
 
 // Field functions
 SafeCall<il2cpp_field_get_type_fn> il2cpp_field_get_type;
 SafeCall<il2cpp_field_get_name_fn> il2cpp_field_get_name;
 SafeCall<il2cpp_field_get_offset_fn> il2cpp_field_get_offset;
+SafeCall<il2cpp_field_static_get_value_fn> il2cpp_field_static_get_value;
+SafeCall<il2cpp_field_get_flags_fn> il2cpp_field_get_flags;
+SafeCall<il2cpp_field_get_default_value_fn> il2cpp_field_get_default_value;
+SafeCall<il2cpp_field_get_value_object_fn> il2cpp_field_get_value_object;
 
 // Method functions
 SafeCall<il2cpp_method_get_name_fn> il2cpp_method_get_name;
@@ -62,6 +111,13 @@ SafeCall<il2cpp_method_get_param_fn> il2cpp_method_get_param;
 // Type functions
 SafeCall<il2cpp_type_get_name_fn> il2cpp_type_get_name;
 SafeCall<il2cpp_type_get_attrs_fn> il2cpp_type_get_attrs;
+SafeCall<il2cpp_type_get_type_fn> il2cpp_type_get_type;
+
+// Object functions
+SafeCall<il2cpp_object_unbox_fn> il2cpp_object_unbox;
+
+// Runtime functions
+SafeCall<il2cpp_runtime_class_init_fn> il2cpp_runtime_class_init;
 
 enum class Visibility : uint8_t {
     None = 0,
@@ -130,7 +186,7 @@ void* ResolveIl2CppThunk(void* thunkFunc, void* waitforActivationAddr) {
         uint8_t** indirect = reinterpret_cast<uint8_t**>(next + 6 + ripOffset);
         return *indirect;
     } else if (next[0] == 0x48 && next[1] == 0xB8) {
-        // mov rax, imm64; jmp rax — some Unity builds may do this
+        // mov rax, imm64; jmp rax ï¿½ some Unity builds may do this
         return *reinterpret_cast<void**>(next + 2);
     }
 
@@ -140,15 +196,17 @@ void* ResolveIl2CppThunk(void* thunkFunc, void* waitforActivationAddr) {
 
 template<typename ReturnType, typename... Args>
 bool ValidateFunction(HMODULE hModule, void* waitForActivationAddr, const char* name, SafeCall<ReturnType(*)(Args...)>* funcPtr) {
-    void* funcAddr = GetProcAddress(hModule, name);
-    if (!funcAddr) {
-        std::cerr << "[Dumper] Failed to get address of " << name << "\n";
+    void* funcAddr = reinterpret_cast<void*>(GetProcAddress(hModule, name));
+    if (funcAddr == nullptr) {
+        oss << "[Dumper] Failed to get address of " << name << "\n";
+        DumpLog();
         return false;
     }
 
-    funcAddr = ResolveIl2CppThunk(funcAddr, waitForActivationAddr);
+    funcAddr = ResolveIl2CppThunk(reinterpret_cast<void*>(funcAddr), waitForActivationAddr);
     if (!funcAddr) {
-        std::cerr << "[Dumper] Failed to resolve thunk for " << name << "\n";
+        oss << "[Dumper] Failed to resolve thunk for " << name << "\n";
+        DumpLog();
         return false;
     }
 
@@ -160,23 +218,24 @@ bool ValidateFunction(HMODULE hModule, void* waitForActivationAddr, const char* 
 #define VALIDATE_PTR(ptr) \
     if (ValidateFunction(gameAssembly, waitForActivationAddr, #ptr, &ptr)) \
     { \
-        std::cout << "[Dumper] Got " #ptr " at " << std::hex << ptr.func << std::endl; \
+        oss << "[Dumper] Got " #ptr " at " << std::hex << ptr.func << std::endl; \
+        DumpLog(); \
     } else { \
-        std::cout << "[Dumper] Failed to get " #ptr "\n"; \
+        oss << "[Dumper] Failed to get " #ptr "\n"; \
+        DumpLog(); \
         return false; \
     } \
 
 bool ValidateFunctions(HMODULE gameAssembly) {
     // Initialize function pointers
     // Function pointers
-    void* waitForActivationAddr = GetProcAddress(gameAssembly, "WaitForActivation");
+    void* waitForActivationAddr = reinterpret_cast<void*>(GetProcAddress(gameAssembly, "WaitForActivation"));
 
     // Domain functions
     VALIDATE_PTR(il2cpp_domain_get);
     VALIDATE_PTR(il2cpp_domain_get_assemblies);
 
     // Assembly functions
-    VALIDATE_PTR(il2cpp_assembly_get_name);
     VALIDATE_PTR(il2cpp_assembly_get_image);
 
     // Image functions
@@ -189,14 +248,23 @@ bool ValidateFunctions(HMODULE gameAssembly) {
     VALIDATE_PTR(il2cpp_class_get_fields);
     VALIDATE_PTR(il2cpp_class_get_methods);
     VALIDATE_PTR(il2cpp_class_get_namespace);
+    VALIDATE_PTR(il2cpp_class_from_type);
     VALIDATE_PTR(il2cpp_class_get_type);
     VALIDATE_PTR(il2cpp_class_get_image);
     VALIDATE_PTR(il2cpp_class_get_parent);
+    VALIDATE_PTR(il2cpp_class_get_element_class);
+
+    // Enum class functions
+    VALIDATE_PTR(il2cpp_class_is_enum);
+    VALIDATE_PTR(il2cpp_class_enum_basetype);
 
     // Field functions
     VALIDATE_PTR(il2cpp_field_get_type);
     VALIDATE_PTR(il2cpp_field_get_name);
     VALIDATE_PTR(il2cpp_field_get_offset);
+    VALIDATE_PTR(il2cpp_field_static_get_value);
+    VALIDATE_PTR(il2cpp_field_get_flags);
+    VALIDATE_PTR(il2cpp_field_get_default_value);
 
     // Method functions
     VALIDATE_PTR(il2cpp_method_get_name);
@@ -207,6 +275,13 @@ bool ValidateFunctions(HMODULE gameAssembly) {
     // Type functions
     VALIDATE_PTR(il2cpp_type_get_name);
     VALIDATE_PTR(il2cpp_type_get_attrs);
+    VALIDATE_PTR(il2cpp_type_get_type);
+
+    // Object functions
+    VALIDATE_PTR(il2cpp_object_unbox);
+
+    // Runtime functions
+    VALIDATE_PTR(il2cpp_runtime_class_init);
 
     return true;
 }
@@ -256,6 +331,42 @@ std::map<std::string, std::string> typeMap = {
     {"System.Collections.Generic.Dictionary", "Dictionary"}
 };
 
+static bool EnumUnderlyingWidth(Il2CppClass* enumKlass, size_t* outSize) {
+    const Il2CppType* bt = il2cpp_class_enum_basetype(enumKlass);
+    if (!bt) return false;
+    switch (il2cpp_type_get_type(bt)) {
+        case IL2CPP_TYPE_I1: case IL2CPP_TYPE_U1: *outSize = 1; return true;
+        case IL2CPP_TYPE_I2: case IL2CPP_TYPE_U2: *outSize = 2; return true;
+        case IL2CPP_TYPE_I4: case IL2CPP_TYPE_U4: *outSize = 4; return true;
+        case IL2CPP_TYPE_I8: case IL2CPP_TYPE_U8: *outSize = 8; return true;
+        default: return false;
+    }
+}
+
+static bool GetEnumLiteralI64(const FieldInfo* field, Il2CppClass* enumKlass, int64_t* out) {
+    // Must be a static literal field
+    uint32_t flags = il2cpp_field_get_flags(field);
+    if ((flags & FIELD_ATTRIBUTE_STATIC) == 0 || (flags & FIELD_ATTRIBUTE_LITERAL) == 0)
+        return false;
+
+    Il2CppObject* boxed = il2cpp_field_get_value_object(field, NULL); // static -> obj = NULL
+    if (!boxed) return false;
+
+    void* raw = il2cpp_object_unbox(boxed);
+    if (!raw) return false;
+
+    size_t w = 0;
+    if (!EnumUnderlyingWidth(enumKlass, &w)) w = 4; // most enums default to I4
+
+    switch (w) {
+        case 1: *out = *reinterpret_cast<const int8_t*>(raw);  return true;
+        case 2: *out = *reinterpret_cast<const int16_t*>(raw); return true;
+        case 4: *out = *reinterpret_cast<const int32_t*>(raw); return true;
+        case 8: *out = *reinterpret_cast<const int64_t*>(raw); return true;
+        default: return false;
+    }
+}
+
 void ReplaceStringTypes(std::string& typeName) {
     // replace any string from the typeMap keys with the value
     for (const auto& pair : typeMap) {
@@ -271,6 +382,113 @@ void ReplaceStringTypes(std::string& typeName) {
             pos += pair.second.length(); // advance past the replacement
         }
     }
+}
+
+void EnumResolverThread(const std::string& outputPath) {
+    using namespace std::chrono_literals;
+    const int maxRetries = 100;
+    int retries = 0;
+
+    auto numEnums = unresolvedEnums.size();
+    OutputDebugStringA(("[Dumper] Starting Enum Resolver Thread for " + std::to_string(numEnums) + " enums.\n").c_str());
+
+    std::map<std::string, std::map<std::string, int64_t>> resolved;
+    bool isEmpty = unresolvedEnums.empty();
+
+    while (isEmpty) {
+        {
+            std::lock_guard<std::mutex> lock(enumMutex);
+            for (auto it = unresolvedEnums.begin(); it != unresolvedEnums.end();) {
+                Il2CppClass* klass = it->klass;
+                if (!klass) { it = unresolvedEnums.erase(it); continue; }
+
+                // You already gated on enums when pushing, but be defensive:
+                if (!il2cpp_class_is_enum(klass)) { it = unresolvedEnums.erase(it); continue; }
+
+                // Make sure class statics are initialized (safe no-op for literal enums)
+                il2cpp_runtime_class_init(klass);
+
+                // Find the matching static literal field by name
+                void* iter = NULL;
+                const FieldInfo* f = NULL;
+                const FieldInfo* match = NULL;
+
+                while ((f = il2cpp_class_get_fields(klass, &iter))) {
+                    const char* fname = il2cpp_field_get_name(f);
+                    if (!fname || it->fieldName != fname) continue;
+
+                    uint32_t flags = il2cpp_field_get_flags(f);
+                    if ((flags & FIELD_ATTRIBUTE_STATIC) == 0) continue;
+                    if ((flags & FIELD_ATTRIBUTE_LITERAL) == 0) continue; // enum members should be literal
+
+                    match = f;
+                    break;
+                }
+
+                if (!match) { ++it; continue; }
+
+                int64_t value = 0;
+                if (GetEnumLiteralI64(match, it->klass, &value)) {
+                    resolved[it->enumName][it->fieldName] = value;
+                    oss << "[Dumper] Resolved enum " << it->enumName << "::" << it->fieldName
+                        << " = " << value << " (offset: " << it->offset << ", base type: " << it->baseType << ")\n";
+                    DumpLog();
+
+                    it = unresolvedEnums.erase(it); // remove from unresolved list
+                    isEmpty = unresolvedEnums.empty();
+                } else {
+                    // couldnâ€™t read yet; try again later
+                }
+            }
+        }
+
+        std::this_thread::sleep_for(100ms);
+    }
+
+    // Output to file
+    std::filesystem::path dumpPath = outputPath / std::filesystem::path("EnumValuesResolved.txt");
+    std::ofstream out(dumpPath);
+    for (const auto& [enumName, fields] : resolved) {
+        out << "enum class " << enumName << " {\n";
+        for (const auto& [fieldName, value] : fields) {
+            out << "    " << fieldName << " = " << value << ",\n";
+        }
+        out << "};\n\n";
+    }
+}
+
+void DumpEnumClass(std::ofstream& file, const Il2CppImage* image, Il2CppClass* klass, HMODULE gameAssembly) {
+    std::string namespaceName = il2cpp_class_get_namespace(klass);
+    std::string enumName = il2cpp_class_get_name(klass);
+    std::string imageName = il2cpp_image_get_name(image);
+    const Il2CppType* baseType = il2cpp_class_enum_basetype(klass);
+
+    std::string baseTypeStr = baseType ? il2cpp_type_get_name(baseType) : "int";
+    file << "enum class " << namespaceName << ( namespaceName.empty() ? "" : ".") << enumName << " : " << baseTypeStr << " {\n";
+
+    // Defensive fallback (rare, but some odd versions/mods)
+    if (!baseType) {
+        Il2CppClass* elem = il2cpp_class_get_element_class(klass);
+        if (elem) baseType = il2cpp_class_get_type(elem);
+    }
+
+    void* fieldIter = nullptr;
+    FieldInfo* field = nullptr;
+
+    while ((field = il2cpp_class_get_fields(klass, &fieldIter)) != nullptr) {
+        unsigned int attrs = il2cpp_type_get_attrs(baseType);
+        if (!(attrs & FIELD_ATTRIBUTE_STATIC))
+            continue;
+
+        const char* name = il2cpp_field_get_name(field);
+
+        //Il2CppObject* value = nullptr;
+        int value = 0;
+        il2cpp_field_static_get_value(field, &value);
+        file << "    " << name << " = " << value << ",\n";
+    }
+
+    file << "};\n";
 }
 
 void DumpCppStyleClass(std::ofstream& file, const Il2CppImage* image, Il2CppClass* klass) {
@@ -411,31 +629,34 @@ void DumpCppStyleClass(std::ofstream& file, const Il2CppImage* image, Il2CppClas
 
 void DumpAllTypes(HMODULE gameAssembly, const std::string& outputPath) {
     if (!ValidateFunctions(gameAssembly)) {
-        std::cout << "[Dumper] Failed to validate functions\n";
+        oss << "[Dumper] Failed to validate functions\n";
+        DumpLog();
         return;
     }
 
     const Il2CppDomain* domain = il2cpp_domain_get();
     if (!domain) {
-        std::cout << "[Dumper] il2cpp_domain_get returned nullptr";
+        oss << "[Dumper] il2cpp_domain_get returned nullptr";
+        DumpLog();
         return;
     }
 
     size_t count = 0;
     const Il2CppAssembly** assemblies = il2cpp_domain_get_assemblies(domain, &count);
     if (!assemblies) {
-        std::cout << "[Dumper] il2cpp_domain_get_assemblies returned nullptr";
+        OutputDebugStringA("[Dumper] il2cpp_domain_get_assemblies returned nullptr");
         return;
     }
 
     if (count == 0) {
-        std::cout << "[Dumper] il2cpp_domain_get_assemblies returned with 0 assemblies";
+        OutputDebugStringA("[Dumper] il2cpp_domain_get_assemblies returned with 0 assemblies");
         return;
     }
 
     // Check for directory "Il2CppDump"
     if (!std::filesystem::exists(outputPath)) {
-        std::cout << "[Dumper] Creating directory: " << outputPath << std::endl;
+        oss << "[Dumper] Creating directory: " << outputPath << std::endl;
+        DumpLog();
         std::filesystem::create_directory(outputPath);
     }
 
@@ -457,30 +678,38 @@ void DumpAllTypes(HMODULE gameAssembly, const std::string& outputPath) {
             Il2CppClass* klass = il2cpp_image_get_class(image, j);
             if (!klass)  continue;
 
-            DumpCppStyleClass(file, image, klass);
+            if (il2cpp_class_is_enum(klass))
+                DumpEnumClass(file, image, klass, gameAssembly);
+            else 
+                DumpCppStyleClass(file, image, klass);
         }
 
         file.close();
     }
 }
 
-IL2RD_API void DumpIl2CppRuntime(HMODULE gameAssembly, const std::string& outputPath) {
+IL2RD_API void DumpIl2CppRuntime(HMODULE gameAssembly, const char* outputPath) {
     if (!gameAssembly) {
-        std::cout << "[Dumper] Invalid game assembly handle\n";
+        OutputDebugStringA("[Dumper] Invalid game assembly handle\n");
         return;
     }
 
-    if (outputPath.empty()) {
-        std::cout << "[Dumper] Invalid output path\n";
+    if (!outputPath || !*outputPath) {
+        OutputDebugStringA("[Dumper] Invalid output path\n");
         return;
     }
+
+    std::string out(outputPath);
 
     // Initialize the Il2Cpp functions
     if (!ValidateFunctions(gameAssembly)) {
-        std::cout << "[Dumper] Failed to validate functions\n";
+        OutputDebugStringA("[Dumper] Failed to validate functions\n");
         return;
     }
 
     // Dump all types
-    DumpAllTypes(gameAssembly, outputPath);
+    DumpAllTypes(gameAssembly, out);
+
+    std::thread resolverThread(EnumResolverThread, out);
+    resolverThread.detach(); // Or store the handle if you want to `join` later
 }
